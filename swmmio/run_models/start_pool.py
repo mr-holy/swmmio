@@ -1,43 +1,29 @@
 from swmmio.run_models import run
 from swmmio import Model
-from multiprocessing import Pool, cpu_count
-from datetime import datetime
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from multiprocessing import cpu_count
+import logging
 import os
 
-wd = os.getcwd()
-log_start_time = datetime.now().strftime("%y%m%d_%H%M")
+logger = logging.getLogger(__name__)
 
+def run_swmm_engine(inp_path, force=False):
+    m = Model(inp_path)
+    if not force and m.rpt_is_valid():
+        return {"path": inp_path, "status": "skipped"}
+    return run.run_hot_start_sequence(m.inp.path)
 
-def run_swmm_engine(inp_folder):
-
-    logfile = os.path.join(wd, 'log_'+log_start_time+'.txt')
-
-    m = Model(inp_folder)
-    if not m.rpt_is_valid():
-        # if the rpt is not valid i.e. not having current, usable data: run
-        with open (logfile, 'a') as f:
-            now = datetime.now().strftime("%y-%m-%d %H:%M")
-            f.write('{}: started at {} '.format(m.inp.name, now))
-            # print 'running {}\n'.format(m.inp.name)
-            run.run_hot_start_sequence(m.inp.path)
-            now = datetime.now().strftime("%y-%m-%d %H:%M")
-            f.write(', completed at {}\n'.format(now))
-    else:
-        with open (logfile, 'a') as f:
-            f.write('{}: skipped (up-to-date)\n'.format(m.inp.name))
-
-
-def main(inp_paths, cores_left):
-
-    """
-    called from the cli:
-    swmmio -sp DIR1, DIR2, ... -cores_left=4
-    """
-
-    # create multiprocessing Pool object using all cores less the -cores_left
-    # beware of setting -cores_left=0, CPU usage will max the F out
-    pool = Pool(cpu_count() - cores_left)
-
-    # create a process pool with the run_swmm_engine() func on each directory
-    res = pool.map(run_swmm_engine, inp_paths)
-
+def main(inp_paths, cores_left=1, force=False):
+    workers = max(1, cpu_count() - cores_left)
+    results = []
+    with ProcessPoolExecutor(max_workers=workers) as pool:
+        futures = {pool.submit(run_swmm_engine, p, force): p for p in inp_paths}
+        for future in as_completed(futures):
+            path = futures[future]
+            try:
+                result = future.result()
+            except Exception as e:
+                result = {"path": path, "status": "failed", "error": str(e)}
+            results.append(result)
+            logger.info(result)
+    return results  # caller can inspect or save this

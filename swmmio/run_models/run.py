@@ -1,59 +1,62 @@
 import subprocess
 import os
-
-import pandas as pd
-
+import shutil
+import logging
 from swmmio import Model
-from swmmio.defs.config import PYTHON_EXE_PATH, PYSWMM_WRAPPER_PATH
 
+logger = logging.getLogger(__name__)
 
-def run_simple(inp_path, py_path=PYTHON_EXE_PATH, pyswmm_wrapper=PYSWMM_WRAPPER_PATH):
+def run_simple(inp_path):
+    """Run a SWMM model via PySWMM directly (no subprocess wrapper needed)."""
+    try:
+        from pyswmm import Simulation
+        with Simulation(inp_path) as sim:
+            sim.execute()
+        logger.info(f"Completed: {inp_path}")
+        return {"path": inp_path, "status": "success", "error": None}
+    except Exception as e:
+        logger.error(f"Failed: {inp_path} — {e}")
+        return {"path": inp_path, "status": "failed", "error": str(e)}
+
+def run_hot_start_sequence(inp_path):
     """
-    run a model once as is.
+    Run a 3-phase hot-start sequence without mutating the original .inp.
+    Works on a temporary copy to preserve the original.
     """
-    print('running {}'.format(inp_path))
-    # inp_path = model.inp.path
-    rpt_path = os.path.splitext(inp_path)[0] + '.rpt'
-    out_path = os.path.splitext(inp_path)[0] + '.out'
+    import tempfile, pandas as pd
+    
+    base_dir = os.path.dirname(inp_path)
+    name = os.path.splitext(os.path.basename(inp_path))[0]
+    
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp_inp = os.path.join(tmpdir, os.path.basename(inp_path))
+        shutil.copy2(inp_path, tmp_inp)
+        model = Model(tmp_inp)
 
-    # Pass Environment Info to Run
-    env_definition = os.environ.copy()
-    env_definition["PATH"] = "/usr/sbin:/sbin:" + env_definition["PATH"]
+        hotstart1 = os.path.join(tmpdir, name + '_hot1.hsf')
+        hotstart2 = os.path.join(tmpdir, name + '_hot2.hsf')
 
-    subprocess.call([py_path, pyswmm_wrapper, inp_path, rpt_path, out_path],
-                    env=env_definition)
-    return 0
+        # Phase 1: ignore rainfall, save hotstart1
+        model.inp.options.loc['IGNORE_RAINFALL', 'Value'] = 'YES'
+        model.inp.files = pd.DataFrame(
+            [f'SAVE HOTSTART "{hotstart1}"'], columns=['[FILES]'])
+        model.inp.save()
+        result = run_simple(model.inp.path)
+        if result["status"] == "failed":
+            return result  # abort sequence
 
+        # Phase 2: use hotstart1, save hotstart2
+        model.inp.files = pd.DataFrame(
+            [f'USE HOTSTART "{hotstart1}"', f'SAVE HOTSTART "{hotstart2}"'],
+            columns=['[FILES]'])
+        model.inp.save()
+        result = run_simple(model.inp.path)
+        if result["status"] == "failed":
+            return result
 
-def run_hot_start_sequence(inp_path, py_path=PYTHON_EXE_PATH, pyswmm_wrapper=PYSWMM_WRAPPER_PATH):
-
-    model = Model(inp_path)
-    hotstart1 = os.path.join(model.inp.dir, model.inp.name + '_hot1.hsf')
-    hotstart2 = os.path.join(model.inp.dir, model.inp.name + '_hot2.hsf')
-
-    # create new model inp with params to save hotstart1
-    print('create new model inp with params to save hotstart1')
-
-    model.inp.report.loc[:, 'Status'] = 'NONE'
-    model.inp.report.loc[['INPUT', 'CONTROLS'], 'Status'] = 'NO'
-    model.inp.files = pd.DataFrame([f'SAVE HOTSTART "{hotstart1}"'], columns=['[FILES]'])
-    model.inp.options.loc['IGNORE_RAINFALL', 'Value'] = 'YES'
-    model.inp.save()
-
-    run_simple(model.inp.path, py_path=py_path, pyswmm_wrapper=pyswmm_wrapper)
-
-    # create new model inp with params to use hotstart1 and save hotstart2
-    print('with params to use hotstart1 and save hotstart2')
-    model.inp.files = pd.DataFrame([f'USE HOTSTART "{hotstart1}"', f'SAVE HOTSTART "{hotstart2}"'], columns=['[FILES]'])
-    model.inp.save()
-
-    run_simple(model.inp.path, py_path=py_path, pyswmm_wrapper=pyswmm_wrapper)
-
-    # create new model inp with params to use hotstart2 and not save anything
-    print('params to use hotstart2 and not save anything')
-
-    model.inp.files = pd.DataFrame([f'USE HOTSTART "{hotstart2}"'], columns=['[FILES]'])
-    model.inp.options.loc['IGNORE_RAINFALL', 'Value'] = 'NO'
-    model.inp.save()
-
-    return run_simple(model.inp.path, py_path=py_path, pyswmm_wrapper=pyswmm_wrapper)
+        # Phase 3: use hotstart2, restore rainfall
+        model.inp.files = pd.DataFrame(
+            [f'USE HOTSTART "{hotstart2}"'], columns=['[FILES]'])
+        model.inp.options.loc['IGNORE_RAINFALL', 'Value'] = 'NO'
+        model.inp.save()
+        return run_simple(model.inp.path)
